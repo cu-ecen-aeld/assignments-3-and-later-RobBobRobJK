@@ -23,6 +23,6 @@ jobs:
           - name: Checkout submodules
             run : git submodule update --init --recursive
           - name: Install cross compiler
-            run: apt-get install -y gcc-aarch64-linux-gnu
+            run: apt-get update && apt-get install -y gcc-aarch64-linux-gnu
           - name: Run full test
             run: ./full-test.sh
