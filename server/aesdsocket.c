@@ -6,6 +6,8 @@
 #include <signal.h>
 #include <syslog.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -17,15 +19,118 @@
 #define BUFSIZE 1024
 
 static int server_fd = -1;
-static int client_fd = -1;
 static volatile int caught_signal = 0;
+static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+static timer_t timer_id;
+
+/* Singly linked list node for tracking threads */
+typedef struct thread_node {
+    pthread_t thread;
+    int client_fd;
+    int complete;
+    struct thread_node *next;
+} thread_node_t;
+
+static thread_node_t *thread_list = NULL;
 
 void signal_handler(int sig)
 {
     syslog(LOG_INFO, "Caught signal, exiting");
     caught_signal = 1;
-    if (client_fd != -1) shutdown(client_fd, SHUT_RDWR);
     if (server_fd != -1) shutdown(server_fd, SHUT_RDWR);
+}
+
+/* Timer callback - appends RFC 2822 timestamp to data file every 10 seconds */
+void timer_handler(union sigval sv)
+{
+    time_t t = time(NULL);
+    struct tm *tmp = localtime(&t);
+    if (!tmp) return;
+
+    char timebuf[128];
+    strftime(timebuf, sizeof(timebuf), "timestamp:%a, %d %b %Y %T %z\n", tmp);
+
+    pthread_mutex_lock(&file_mutex);
+    FILE *f = fopen(DATAFILE, "a");
+    if (f) {
+        fputs(timebuf, f);
+        fclose(f);
+    }
+    pthread_mutex_unlock(&file_mutex);
+}
+
+void init_timer(void)
+{
+    struct sigevent sev;
+    memset(&sev, 0, sizeof(sev));
+    sev.sigev_notify = SIGEV_THREAD;
+    sev.sigev_notify_function = timer_handler;
+    sev.sigev_notify_attributes = NULL;
+
+    if (timer_create(CLOCK_REALTIME, &sev, &timer_id) != 0) {
+        syslog(LOG_ERR, "timer_create failed: %s", strerror(errno));
+        return;
+    }
+
+    struct itimerspec its;
+    its.it_value.tv_sec = 10;
+    its.it_value.tv_nsec = 0;
+    its.it_interval.tv_sec = 10;
+    its.it_interval.tv_nsec = 0;
+
+    if (timer_settime(timer_id, 0, &its, NULL) != 0) {
+        syslog(LOG_ERR, "timer_settime failed: %s", strerror(errno));
+    }
+}
+
+/* Thread function - handles one client connection */
+void *thread_func(void *arg)
+{
+    thread_node_t *node = (thread_node_t *)arg;
+    int cfd = node->client_fd;
+    char *buf = NULL;
+    size_t buf_used = 0;
+    char tmp[BUFSIZE];
+    ssize_t bytes;
+
+    /* Receive until newline */
+    while (1) {
+        bytes = recv(cfd, tmp, sizeof(tmp), 0);
+        if (bytes <= 0) goto cleanup;
+
+        char *newbuf = realloc(buf, buf_used + bytes + 1);
+        if (!newbuf) { syslog(LOG_ERR, "realloc failed"); goto cleanup; }
+        buf = newbuf;
+        memcpy(buf + buf_used, tmp, bytes);
+        buf_used += bytes;
+        buf[buf_used] = '\0';
+
+        if (memchr(tmp, '\n', bytes)) break;
+    }
+
+    /* Append to file under mutex */
+    pthread_mutex_lock(&file_mutex);
+    FILE *f = fopen(DATAFILE, "a");
+    if (f) {
+        fwrite(buf, 1, buf_used, f);
+        fclose(f);
+    }
+
+    /* Send full file back under same mutex */
+    f = fopen(DATAFILE, "r");
+    if (f) {
+        while ((bytes = fread(tmp, 1, sizeof(tmp), f)) > 0) {
+            send(cfd, tmp, bytes, 0);
+        }
+        fclose(f);
+    }
+    pthread_mutex_unlock(&file_mutex);
+
+cleanup:
+    free(buf);
+    close(cfd);
+    node->complete = 1;
+    return node;
 }
 
 void daemonize(void)
@@ -33,16 +138,12 @@ void daemonize(void)
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); exit(EXIT_FAILURE); }
     if (pid > 0) exit(EXIT_SUCCESS);
-
     if (setsid() < 0) { perror("setsid"); exit(EXIT_FAILURE); }
-
     pid = fork();
     if (pid < 0) { perror("fork"); exit(EXIT_FAILURE); }
     if (pid > 0) exit(EXIT_SUCCESS);
-
     umask(0);
     chdir("/");
-
     int fd = open("/dev/null", O_RDWR);
     if (fd != -1) {
         dup2(fd, STDIN_FILENO);
@@ -52,62 +153,17 @@ void daemonize(void)
     }
 }
 
-int handle_connection(int cfd, const char *client_ip)
+/* Join and free all completed threads from the list */
+void cleanup_threads(void)
 {
-    char *buf = NULL;
-    size_t buf_size = 0;
-    size_t buf_used = 0;
-    char tmp[BUFSIZE];
-    ssize_t bytes;
-    int rc = 0;
-
-    /* Receive until newline */
-    while (1) {
-        bytes = recv(cfd, tmp, sizeof(tmp), 0);
-        if (bytes <= 0) { rc = -1; goto cleanup; }
-
-        if (buf_used + bytes + 1 > buf_size) {
-            buf_size = buf_used + bytes + 1;
-            char *newbuf = realloc(buf, buf_size);
-            if (!newbuf) {
-                syslog(LOG_ERR, "realloc failed");
-                rc = -1; goto cleanup;
-            }
-            buf = newbuf;
-        }
-        memcpy(buf + buf_used, tmp, bytes);
-        buf_used += bytes;
-        buf[buf_used] = '\0';
-
-        if (memchr(tmp, '\n', bytes)) break;
+    thread_node_t *cur = thread_list;
+    while (cur) {
+        thread_node_t *next = cur->next;
+        pthread_join(cur->thread, NULL);
+        free(cur);
+        cur = next;
     }
-
-    /* Append to file */
-    FILE *f = fopen(DATAFILE, "a");
-    if (!f) {
-        syslog(LOG_ERR, "fopen failed: %s", strerror(errno));
-        rc = -1; goto cleanup;
-    }
-    fwrite(buf, 1, buf_used, f);
-    fclose(f);
-
-    /* Send full file back */
-    f = fopen(DATAFILE, "r");
-    if (!f) {
-        syslog(LOG_ERR, "fopen read failed: %s", strerror(errno));
-        rc = -1; goto cleanup;
-    }
-    while ((bytes = fread(tmp, 1, sizeof(tmp), f)) > 0) {
-        if (send(cfd, tmp, bytes, 0) < 0) {
-            fclose(f);
-            rc = -1; goto cleanup;
-        }
-    }
-    fclose(f);
-
-cleanup:
-    free(buf);
-    return rc;
+    thread_list = NULL;
 }
 
 int main(int argc, char *argv[])
@@ -156,11 +212,13 @@ int main(int argc, char *argv[])
 
     if (daemon_mode) daemonize();
 
+    init_timer();
+
     while (!caught_signal) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
 
-        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
             if (caught_signal) break;
             syslog(LOG_ERR, "accept failed: %s", strerror(errno));
@@ -171,15 +229,35 @@ int main(int argc, char *argv[])
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
         syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 
-        handle_connection(client_fd, client_ip);
+        /* Allocate thread node and spawn thread */
+        thread_node_t *node = malloc(sizeof(thread_node_t));
+        if (!node) {
+            syslog(LOG_ERR, "malloc failed");
+            close(client_fd);
+            continue;
+        }
+        node->client_fd = client_fd;
+        node->complete = 0;
+        node->next = thread_list;
+        thread_list = node;
+
+        if (pthread_create(&node->thread, NULL, thread_func, node) != 0) {
+            syslog(LOG_ERR, "pthread_create failed");
+            close(client_fd);
+            free(node);
+            thread_list = thread_list->next;
+            continue;
+        }
 
         syslog(LOG_INFO, "Closed connection from %s", client_ip);
-        close(client_fd);
-        client_fd = -1;
     }
 
+    /* Cleanup on signal */
+    timer_delete(timer_id);
+    cleanup_threads();
     close(server_fd);
     server_fd = -1;
+    pthread_mutex_destroy(&file_mutex);
     remove(DATAFILE);
     closelog();
     return 0;
