@@ -15,13 +15,22 @@
 #include <arpa/inet.h>
 
 #define PORT 9000
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+#if USE_AESD_CHAR_DEVICE
+#define DATAFILE "/dev/aesdchar"
+#else
 #define DATAFILE "/var/tmp/aesdsocketdata"
+#endif
 #define BUFSIZE 1024
 
 static int server_fd = -1;
 static volatile int caught_signal = 0;
 static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+#if !USE_AESD_CHAR_DEVICE
 static timer_t timer_id;
+#endif
 
 /* Singly linked list node for tracking threads */
 typedef struct thread_node {
@@ -40,6 +49,7 @@ void signal_handler(int sig)
     if (server_fd != -1) shutdown(server_fd, SHUT_RDWR);
 }
 
+#if !USE_AESD_CHAR_DEVICE
 /* Timer callback - appends RFC 2822 timestamp to data file every 10 seconds */
 void timer_handler(union sigval sv)
 {
@@ -82,6 +92,8 @@ void init_timer(void)
         syslog(LOG_ERR, "timer_settime failed: %s", strerror(errno));
     }
 }
+
+#endif
 
 /* Thread function - handles one client connection */
 void *thread_func(void *arg)
@@ -212,7 +224,9 @@ int main(int argc, char *argv[])
 
     if (daemon_mode) daemonize();
 
+#if !USE_AESD_CHAR_DEVICE
     init_timer();
+#endif
 
     while (!caught_signal) {
         struct sockaddr_in client_addr;
@@ -253,12 +267,16 @@ int main(int argc, char *argv[])
     }
 
     /* Cleanup on signal */
+#if !USE_AESD_CHAR_DEVICE
     timer_delete(timer_id);
+#endif
     cleanup_threads();
     close(server_fd);
     server_fd = -1;
     pthread_mutex_destroy(&file_mutex);
+#if !USE_AESD_CHAR_DEVICE
     remove(DATAFILE);
+#endif
     closelog();
     return 0;
 }
