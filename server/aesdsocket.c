@@ -20,6 +20,7 @@
 #endif
 #if USE_AESD_CHAR_DEVICE
 #define DATAFILE "/dev/aesdchar"
+#include "../aesd-char-driver/aesd_ioctl.h"
 #else
 #define DATAFILE "/var/tmp/aesdsocketdata"
 #endif
@@ -119,6 +120,29 @@ void *thread_func(void *arg)
 
         if (memchr(tmp, '\n', bytes)) break;
     }
+
+#if USE_AESD_CHAR_DEVICE
+    /* Seek command: AESDCHAR_IOCSEEKTO:X,Y is not written to the device */
+    {
+        unsigned int x, y;
+        if (sscanf(buf, "AESDCHAR_IOCSEEKTO:%u,%u", &x, &y) == 2) {
+            struct aesd_seekto st = { x, y };
+            pthread_mutex_lock(&file_mutex);
+            int dfd = open(DATAFILE, O_RDWR);
+            if (dfd >= 0) {
+                if (ioctl(dfd, AESDCHAR_IOCSEEKTO, &st) == 0) {
+                    while ((bytes = read(dfd, tmp, sizeof(tmp))) > 0)
+                        send(cfd, tmp, bytes, 0);
+                } else {
+                    syslog(LOG_ERR, "AESDCHAR_IOCSEEKTO failed: %s", strerror(errno));
+                }
+                close(dfd);
+            }
+            pthread_mutex_unlock(&file_mutex);
+            goto cleanup;
+        }
+    }
+#endif
 
     /* Append to file under mutex */
     pthread_mutex_lock(&file_mutex);
